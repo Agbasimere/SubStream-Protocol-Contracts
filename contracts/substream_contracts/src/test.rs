@@ -15,7 +15,7 @@ fn create_token_contract<'a>(env: &Env, admin: &Address) -> token::Client<'a> {
 }
 
 #[test]
-fn test_subscribe_and_collect() {
+fn test_is_subscribed_active() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -30,6 +30,16 @@ fn test_subscribe_and_collect() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &10);
+
+    // Still active: expiry = 100 + (100/10) = 110
+    env.ledger().set_timestamp(105);
+    assert!(client.is_subscribed(&subscriber, &creator));
+}
+
+#[test]
+fn test_is_subscribed_expired() {
     let start = 100u64;
     env.ledger().set_timestamp(start);
     env.ledger().set_timestamp(100);
@@ -375,6 +385,16 @@ fn test_pause_channel_blocks_charges_and_unpause_resumes() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &10);
+
+    // Expired: expiry = 100 + (100/10) = 110
+    env.ledger().set_timestamp(111);
+    assert!(!client.is_subscribed(&subscriber, &creator));
+}
+
+#[test]
+fn test_is_subscribed_none() {
     let start = 100u64;
     env.ledger().set_timestamp(start);
     client.subscribe(&subscriber, &creator, &token.address, &300, &2);
@@ -638,6 +658,8 @@ fn test_migrate_tier_downgrade_prorates_refund() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    // No subscription exists
+    assert!(!client.is_subscribed(&subscriber, &creator));
     client.set_cliff_threshold(&creator, &50);
 
     let start = 100u64;
