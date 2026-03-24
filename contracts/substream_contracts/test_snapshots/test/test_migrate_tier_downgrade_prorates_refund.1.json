@@ -347,6 +347,19 @@
                   {
                     "key": {
                       "symbol": "tier"
+                      "symbol": "percentages"
+                    },
+                    "val": {
+                      "vec": [
+                        {
+                          "u32": 100
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "tier"
                     },
                     "val": {
                       "map": [
@@ -367,6 +380,14 @@
                           }
                         }
                       ]
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "start_time"
+                    },
+                    "val": {
+                      "u64": "100"
                     }
                   },
                   {
