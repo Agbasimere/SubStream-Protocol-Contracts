@@ -55,6 +55,35 @@ fn stream_key(subscriber: &Address, stream_id: &Address) -> DataKey {
     DataKey::Stream(subscriber.clone(), stream_id.clone())
 }
 
+fn stream_exists(env: &Env, key: &DataKey) -> bool {
+    env.storage().persistent().has(key) || env.storage().temporary().has(key)
+}
+
+fn get_stream(env: &Env, key: &DataKey) -> Stream {
+    if env.storage().persistent().has(key) {
+        env.storage().persistent().get(key).unwrap()
+    } else if env.storage().temporary().has(key) {
+        env.storage().temporary().get(key).unwrap()
+    } else {
+        panic!("stream not found")
+    }
+}
+
+fn set_stream(env: &Env, key: &DataKey, stream: &Stream) {
+    if stream.balance > 0 {
+        env.storage().persistent().set(key, stream);
+        env.storage().temporary().remove(key);
+    } else {
+        env.storage().temporary().set(key, stream);
+        env.storage().persistent().remove(key);
+    }
+}
+
+fn remove_stream(env: &Env, key: &DataKey) {
+    env.storage().persistent().remove(key);
+    env.storage().temporary().remove(key);
+}
+
 fn validate_distribution(
     creators: &Vec<Address>,
     percentages: &Vec<u32>,
@@ -145,7 +174,7 @@ fn subscribe_internal(
     }
 
     let key = stream_key(subscriber, stream_id);
-    if env.storage().persistent().has(&key) {
+    if stream_exists(env, &key) {
         panic!("stream already exists");
     }
 
@@ -166,7 +195,7 @@ fn subscribe_internal(
         percentages,
     };
 
-    env.storage().persistent().set(&key, &stream);
+    set_stream(env, &key, &stream);
 }
 
 fn distribute_and_collect(
@@ -176,6 +205,38 @@ fn distribute_and_collect(
     total_streamed_creator: Option<&Address>,
 ) -> i128 {
     let key = stream_key(subscriber, stream_id);
+    let mut stream = get_stream(env, &key);
+    let now = env.ledger().timestamp();
+
+    if now <= stream.last_collected {
+        return 0;
+    }
+
+    if let Some(creator) = total_streamed_creator {
+        if is_creator_paused(env, creator) {
+            // While paused, advance accounting clock so paused time is never billed.
+            stream.last_collected = now;
+            set_stream(env, &key, &stream);
+            return 0;
+        }
+    }
+
+    let trial_end = stream
+        .start_time
+        .saturating_add(stream.tier.trial_duration);
+    let charge_start = if stream.last_collected > trial_end {
+        stream.last_collected
+    } else {
+        trial_end
+    };
+
+    if now <= charge_start {
+        return 0;
+    }
+
+    let elapsed = (now - charge_start) as i128;
+    let mut amount_to_collect = elapsed
+        .checked_mul(stream.tier.rate_per_second)
     if !env.storage().persistent().has(&key) {
         panic!("stream not found");
     }
@@ -230,6 +291,11 @@ fn distribute_and_collect(
     let mut remaining = amount_to_collect;
     let len = stream.creators.len();
 
+
+    let token_client = TokenClient::new(env, &stream.token);
+    let mut remaining = amount_to_collect;
+    let len = stream.creators.len();
+
     for i in 0..len {
         let creator = stream.creators.get(i).unwrap();
         let payout = if i + 1 == len {
@@ -252,6 +318,7 @@ fn distribute_and_collect(
 
     stream.balance -= amount_to_collect;
     stream.last_collected = now;
+    set_stream(env, &key, &stream);
     env.storage().persistent().set(&key, &stream);
 
     if let Some(creator) = total_streamed_creator {
@@ -268,19 +335,19 @@ fn cancel_group_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
     subscriber.require_auth();
 
     let key = stream_key(subscriber, stream_id);
-    if !env.storage().persistent().has(&key) {
+    if !stream_exists(env, &key) {
         panic!("stream not found");
     }
 
     distribute_and_collect(env, subscriber, stream_id, None);
 
-    let stream: Stream = env.storage().persistent().get(&key).unwrap();
+    let stream = get_stream(env, &key);
     if stream.balance > 0 {
         let token_client = TokenClient::new(env, &stream.token);
         token_client.transfer(&env.current_contract_address(), subscriber, &stream.balance);
     }
 
-    env.storage().persistent().remove(&key);
+    remove_stream(env, &key);
 }
 
 fn top_up_internal(env: &Env, subscriber: &Address, stream_id: &Address, amount: i128) {
@@ -291,15 +358,16 @@ fn top_up_internal(env: &Env, subscriber: &Address, stream_id: &Address, amount:
     }
 
     let key = stream_key(subscriber, stream_id);
-    if !env.storage().persistent().has(&key) {
+    if !stream_exists(env, &key) {
         panic!("stream not found");
     }
 
-    let mut stream: Stream = env.storage().persistent().get(&key).unwrap();
+    let mut stream = get_stream(env, &key);
     let token_client = TokenClient::new(env, &stream.token);
     token_client.transfer(subscriber, &env.current_contract_address(), &amount);
 
     stream.balance = stream.balance.checked_add(amount).expect("overflow");
+    set_stream(env, &key, &stream);
     env.storage().persistent().set(&key, &stream);
 }
 
@@ -339,6 +407,11 @@ impl SubStreamContract {
         subscriber.require_auth();
 
         let key = stream_key(&subscriber, &creator);
+        if !stream_exists(&env, &key) {
+            panic!("stream not found");
+        }
+
+        let stream = get_stream(&env, &key);
         if !env.storage().persistent().has(&key) {
             panic!("stream not found");
         }
@@ -351,6 +424,7 @@ impl SubStreamContract {
 
         distribute_and_collect(&env, &subscriber, &creator, Some(&creator));
 
+        let stream_after = get_stream(&env, &key);
         let stream_after: Stream = env.storage().persistent().get(&key).unwrap();
         if stream_after.balance > 0 {
             let token_client = TokenClient::new(&env, &stream_after.token);
@@ -361,6 +435,7 @@ impl SubStreamContract {
             );
         }
 
+        remove_stream(&env, &key);
         env.storage().persistent().remove(&key);
         remove_subscriber_from_creator(&env, &creator, &subscriber);
     }
@@ -417,6 +492,8 @@ impl SubStreamContract {
 
         // Settle all streams up to pause timestamp, then freeze charging.
         for subscriber in subs.iter() {
+            let s_key = stream_key(&subscriber, &creator);
+            if stream_exists(&env, &s_key) {
             if env
                 .storage()
                 .persistent()
@@ -445,6 +522,10 @@ impl SubStreamContract {
         // Resume billing from now so paused window is never charged.
         for subscriber in subs.iter() {
             let s_key = stream_key(&subscriber, &creator);
+            if stream_exists(&env, &s_key) {
+                let mut stream = get_stream(&env, &s_key);
+                stream.last_collected = now;
+                set_stream(&env, &s_key, &stream);
             if env.storage().persistent().has(&s_key) {
                 let mut stream: Stream = env.storage().persistent().get(&s_key).unwrap();
                 stream.last_collected = now;
@@ -478,6 +559,11 @@ impl SubStreamContract {
         }
 
         let key = stream_key(&subscriber, &creator);
+        if !stream_exists(&env, &key) {
+            panic!("stream not found");
+        }
+
+        let stream_before = get_stream(&env, &key);
         if !env.storage().persistent().has(&key) {
             panic!("stream not found");
         }
@@ -487,7 +573,7 @@ impl SubStreamContract {
 
         distribute_and_collect(&env, &subscriber, &creator, Some(&creator));
 
-        let mut stream: Stream = env.storage().persistent().get(&key).unwrap();
+        let mut stream = get_stream(&env, &key);
         let mut balance = stream.balance;
 
         if new_rate_per_second < old_rate && balance > 0 {
@@ -520,7 +606,7 @@ impl SubStreamContract {
                 .expect("overflow");
         }
 
-        env.storage().persistent().set(&key, &stream);
+        set_stream(&env, &key, &stream);
 
         if old_rate != new_rate_per_second {
             TierChanged {
@@ -543,6 +629,8 @@ impl SubStreamContract {
 
         for i in 0..limit {
             let subscriber = subs.get(i).unwrap();
+            let s_key = stream_key(&subscriber, &creator);
+            if stream_exists(&env, &s_key) {
             if env
                 .storage()
                 .persistent()
