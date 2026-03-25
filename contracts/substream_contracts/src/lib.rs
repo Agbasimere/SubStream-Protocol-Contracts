@@ -49,6 +49,23 @@ pub struct TierChanged {
 }
 
 #[contractevent]
+pub struct Subscribed {
+    #[topic]
+    pub subscriber: Address,
+    #[topic]
+    pub creator: Address,
+    pub rate_per_second: i128,
+}
+
+#[contractevent]
+pub struct Unsubscribed {
+    #[topic]
+    pub subscriber: Address,
+    #[topic]
+    pub creator: Address,
+}
+
+#[contractevent]
 pub struct TipReceived {
     #[topic]
     pub user: Address,
@@ -175,6 +192,12 @@ impl SubStreamContract {
         env.storage().persistent().set(&key, &stream);
 
         add_subscriber_to_creator(&env, &creator, &subscriber);
+
+        Subscribed {
+            subscriber: subscriber.clone(),
+            creator: creator.clone(),
+            rate_per_second,
+        }.publish(&env);
     }
 
     pub fn collect(env: Env, subscriber: Address, stream_id: Address) {
@@ -571,6 +594,12 @@ fn subscribe_internal(
         subs.push_back(subscriber.clone());
         env.storage().persistent().set(&creator_key, &subs);
     }
+
+    Subscribed {
+        subscriber: subscriber.clone(),
+        creator: stream_id.clone(),
+        rate_per_second,
+    }.publish(&env);
 }
 
 fn distribute_and_collect(
@@ -777,14 +806,13 @@ fn cancel_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
         token_client.transfer(&env.current_contract_address(), subscriber, &stream.balance);
     }
     env.storage().persistent().remove(&key);
-}
 
-fn update_total_streamed(env: &Env, subscriber: &Address, creator: &Address, amount: i128) {
-    let key = DataKey::TotalStreamed(subscriber.clone(), creator.clone());
-    let current_total: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-    env.storage()
-        .persistent()
-        .set(&key, &(current_total + amount));
+    remove_subscriber_from_creator(env, stream_id, subscriber);
+
+    Unsubscribed {
+        subscriber: subscriber.clone(),
+        creator: stream_id.clone(),
+    }.publish(&env);
 }
 
 fn top_up_internal(env: &Env, subscriber: &Address, stream_id: &Address, amount: i128) {
@@ -868,21 +896,10 @@ fn cancel_group_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
     remove_stream(env, &key);
 
     // Remove subscriber from stream_id's subscriber list
-    let creator_key = DataKey::CreatorSubscribers(stream_id.clone());
-    if let Some(subs) = env
-        .storage()
-        .persistent()
-        .get::<DataKey, Vec<Address>>(&creator_key)
-    {
-        let mut updated: Vec<Address> = vec![env];
-        for s in subs.iter() {
-            if s != *subscriber {
-                updated.push_back(s);
-            }
-        }
-        env.storage().persistent().set(&creator_key, &updated);
-    }
-    remove_stream(env, &key);
-}
+    remove_subscriber_from_creator(env, stream_id, subscriber);
 
-mod test;
+    Unsubscribed {
+        subscriber: subscriber.clone(),
+        creator: stream_id.clone(),
+    }.publish(&env);
+}
